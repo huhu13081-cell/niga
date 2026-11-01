@@ -1,0 +1,423 @@
+local ENV = (function()
+    local e = {}
+
+    -- identity
+    if syn then
+        e.name    = "Synapse X"
+        e.getui   = syn.protect_gui or gethui
+        e.request = syn.request
+        e.decompile = syn.decompile
+
+    elseif KRNL_LOADED or (getgenv and getgenv().KRNL_LOADED) then
+        e.name    = "KRNL"
+        e.getui   = gethui
+        e.request = http_request or request
+
+    elseif fluxus then
+        e.name    = "Fluxus"
+        e.getui   = fluxus.get_hidden_gui or gethui
+        e.request = fluxus.request or request
+
+    elseif REEL_LOADED or (getgenv and getgenv().REEL_LOADED) then
+        e.name    = "REEL"
+        e.getui   = gethui
+        e.request = http_request or request
+
+    elseif Medium or (getgenv and getgenv().Medium) then
+        e.name    = "Medium"
+        e.getui   = gethui
+        e.request = http_request or request
+
+    elseif Solara or (getgenv and getgenv().Solara) then
+        e.name    = "Solara"
+        e.getui   = gethui
+        e.request = http_request or request
+
+    elseif Codex or (getgenv and getgenv().IS_CODEX) then
+        e.name    = "Codex"
+        e.getui   = gethui
+        e.request = http_request or request
+
+    elseif Electron or (getgenv and getgenv().Electron) then
+        e.name    = "Electron"
+        e.getui   = gethui
+        e.request = http_request or request
+
+    elseif Hydrogen or (getgenv and getgenv().Hydrogen) then
+        e.name    = "Hydrogen"
+        -- Hydrogen uses CoreGui parent instead of gethui
+        e.getui   = function() return game:GetService("CoreGui") end
+        e.request = http_request or request
+
+    elseif Delta or (getgenv and getgenv().Delta) then
+        e.name    = "Delta"
+        e.getui   = gethui
+        e.request = http_request or request
+
+    else
+        -- Unknown / future executor — safe fallback
+        e.name    = "Unknown"
+        e.getui   = (gethui and gethui) or function()
+            return game:GetService("CoreGui")
+        end
+        e.request = http_request or request or function() end
+    end
+
+    -- Normalise gethui: some executors return a function, some the object
+    if type(e.getui) == "function" then
+        local ok, result = pcall(e.getui)
+        e.gui_parent = ok and result or game:GetService("CoreGui")
+    else
+        e.gui_parent = e.getui
+    end
+
+    print("[HalloweenFarm] executor →", e.name)
+    return e
+end)()
+
+-- ░░ SETTINGS ░░
+local SETTINGS = {
+    AutoFarm       = true,
+    AutoHalloween  = true,
+    AutoCollect    = true,
+    FruitSnipe     = true,
+    SpeedHack      = true,
+    SpeedValue     = 80,        -- studs/s — keep ≤150 to avoid server kick
+    AntiAFK        = true,
+    SafeMode       = true,      -- jitters loop timing + uses tween-TP
+    TeleportMethod = "Tween",   -- "Tween" | "CFrame" | "Velocity"
+    FarmDelay      = 0.08,      -- base loop delay in seconds
+    ChestDelay     = 0.5,       -- pause after chest collect
+    SnipeInterval  = 2,         -- fruit snipe scan rate
+}
+
+-- ░░ SERVICES ░░
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local TweenService      = game:GetService("TweenService")
+local VirtualUser       = game:GetService("VirtualUser")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LP   = Players.LocalPlayer
+local Char = LP.Character or LP.CharacterAdded:Wait()
+local Root, Hum
+
+local function RefreshChar(c)
+    Char = c
+    Root = c:WaitForChild("HumanoidRootPart")
+    Hum  = c:WaitForChild("Humanoid")
+end
+RefreshChar(Char)
+LP.CharacterAdded:Connect(RefreshChar)
+
+-- ░░ ANTI-DETECT UTILS ░░
+local function Jitter(base)
+    -- randomise wait so server-side loop-frequency checks see noise
+    if SETTINGS.SafeMode then
+        task.wait(base + math.random(0, 25) / 100)
+    else
+        task.wait(base)
+    end
+end
+
+local function SafeTP(cf)
+    if not Root then return end
+    if SETTINGS.TeleportMethod == "Tween" then
+        local t = TweenService:Create(
+            Root,
+            TweenInfo.new(0.1, Enum.EasingStyle.Linear),
+            {CFrame = cf}
+        )
+        t:Play(); t.Completed:Wait()
+    elseif SETTINGS.TeleportMethod == "Velocity" then
+        Root.Velocity = Vector3.zero
+        Root.CFrame   = cf
+    else
+        Root.CFrame = cf
+    end
+end
+
+-- Wrap remote fires so naked calls don't hit anti-cheat monitors
+local function SafeFire(remote, ...)
+    if remote and remote:IsA("RemoteEvent") then
+        pcall(remote.FireServer, remote, ...)
+    end
+end
+
+local function SafeInvoke(remote, ...)
+    if remote and remote:IsA("RemoteFunction") then
+        local ok, res = pcall(remote.InvokeServer, remote, ...)
+        if ok then return res end
+    end
+end
+
+-- Speed with same-frame adjacent write to blur the property-write signature
+local function SetSpeed(v)
+    if Hum and Hum.Parent then
+        Hum.WalkSpeed = v
+        Hum.HipHeight = Hum.HipHeight -- adjacent write noise
+    end
+end
+
+-- ░░ HALLOWEEN EVENT DATA ░░
+local Halloween = {
+    NPCs  = {"Pumpkin King", "Zombie", "Ghost", "Cursed Skeleton", "Witch"},
+    Items = {"Cursed Chest", "Candy Cane", "Pumpkin", "Ghost Orb"},
+    Fruit = "Ghost",  -- update if event fruit name changes post-patch
+}
+
+-- ░░ SCANNERS ░░
+local function FindNPC()
+    for _, model in ipairs(workspace:GetDescendants()) do
+        if model:IsA("Model") then
+            for _, name in ipairs(Halloween.NPCs) do
+                if model.Name:find(name) then
+                    local r = model:FindFirstChild("HumanoidRootPart")
+                    local h = model:FindFirstChildOfClass("Humanoid")
+                    if r and h and h.Health > 0 then
+                        return model, r
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function FindChest()
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        for _, name in ipairs(Halloween.Items) do
+            if obj.Name:find(name) then
+                if obj:IsA("BasePart") then return obj end
+                if obj:IsA("Model") then
+                    return obj:FindFirstChild("HumanoidRootPart") or obj.PrimaryPart
+                end
+            end
+        end
+    end
+end
+
+local function FindEventFruit()
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj.Name:find(Halloween.Fruit) and obj:IsA("BasePart") then
+            return obj
+        end
+    end
+end
+
+-- Remote resolver — Blox Fruits renames remotes per update
+local RemoteCache = {}
+local function GetRemote(path)
+    if RemoteCache[path] then return RemoteCache[path] end
+    local node = ReplicatedStorage
+    for _, seg in ipairs(path:split("/")) do
+        node = node:FindFirstChild(seg)
+        if not node then return nil end
+    end
+    RemoteCache[path] = node
+    return node
+end
+
+-- ░░ ATTACK HELPER ░░
+local function AttackNPC(npcRoot)
+    SafeTP(npcRoot.CFrame + npcRoot.CFrame.LookVector * -4)
+    Jitter(0.05)
+
+    local tool = Char:FindFirstChildOfClass("Tool")
+    if tool then
+        -- try remote first (fruit skills)
+        local remote = tool:FindFirstChildOfClass("RemoteEvent")
+            or tool:FindFirstChild("Activate")
+        if remote and remote:IsA("RemoteEvent") then
+            SafeFire(remote)
+        else
+            pcall(function() tool:Activate() end)
+        end
+    end
+
+    -- fallback: Blox Fruits main attack remote (name varies per patch)
+    local attackRemote = GetRemote("Remotes/Combat")
+        or GetRemote("Remotes/Attack")
+        or GetRemote("Remotes/Skill")
+    if attackRemote then SafeFire(attackRemote, npcRoot.Parent) end
+end
+
+-- ░░ FRUIT SNIPE ░░
+local function SnipeFruit()
+    local fruit = FindEventFruit()
+    if not fruit then return end
+    SafeTP(fruit.CFrame + Vector3.new(0, 3, 0))
+    Jitter(0.3)
+    local eatRemote = GetRemote("Remotes/Eat_Fruit")
+        or GetRemote("Remotes/EatFruit")
+        or GetRemote("Remotes/Fruit/Eat")
+    if eatRemote then SafeFire(eatRemote, fruit) end
+end
+
+-- ░░ MAIN LOOPS ░░
+local function HalloweenLoop()
+    while task.wait() do
+        if not SETTINGS.AutoHalloween then Jitter(1) continue end
+
+        local npc, npcRoot = FindNPC()
+        if npc and npcRoot then
+            AttackNPC(npcRoot)
+            Jitter(SETTINGS.FarmDelay)
+        else
+            if SETTINGS.AutoCollect then
+                local chest = FindChest()
+                if chest then
+                    SafeTP(chest.CFrame + Vector3.new(0, 2, 0))
+                    Jitter(SETTINGS.ChestDelay)
+                end
+            end
+            Jitter(1.2)
+        end
+    end
+end
+
+local function SnipeLoop()
+    while task.wait(SETTINGS.SnipeInterval) do
+        if SETTINGS.FruitSnipe then SnipeFruit() end
+    end
+end
+
+local function SpeedLoop()
+    RunService.Heartbeat:Connect(function()
+        if SETTINGS.SpeedHack then SetSpeed(SETTINGS.SpeedValue) end
+    end)
+end
+
+local function StartAntiAFK()
+    LP.Idled:Connect(function()
+        VirtualUser:Button2Down(Vector2.zero, workspace.CurrentCamera.CFrame)
+        task.wait(0.5)
+        VirtualUser:Button2Up(Vector2.zero, workspace.CurrentCamera.CFrame)
+    end)
+end
+
+-- ░░ GUI ░░
+local ScreenGui  = Instance.new("ScreenGui")
+ScreenGui.Name   = "HWFarm_v2"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+-- parent safely across all executor GUI systems
+local ok = pcall(function() ScreenGui.Parent = ENV.gui_parent end)
+if not ok then
+    pcall(function() ScreenGui.Parent = game:GetService("CoreGui") end)
+end
+
+-- Draggable frame
+local Main = Instance.new("Frame", ScreenGui)
+Main.Size            = UDim2.new(0, 260, 0, 360)
+Main.Position        = UDim2.new(0, 30, 0, 100)
+Main.BackgroundColor3 = Color3.fromRGB(12, 6, 22)
+Main.BorderSizePixel  = 0
+Main.Active    = true
+Main.Draggable = true
+Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 10)
+
+-- drag support for executors that don't honour .Draggable
+do
+    local dragging, dragStart, startPos
+    Main.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging  = true
+            dragStart = i.Position
+            startPos  = Main.Position
+        end
+    end)
+    Main.InputChanged:Connect(function(i)
+        if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then
+            local delta = i.Position - dragStart
+            Main.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+    Main.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+        end
+    end)
+end
+
+-- Title bar
+local TitleBar = Instance.new("Frame", Main)
+TitleBar.Size = UDim2.new(1, 0, 0, 38)
+TitleBar.BackgroundColor3 = Color3.fromRGB(120, 0, 200)
+TitleBar.BorderSizePixel  = 0
+Instance.new("UICorner", TitleBar).CornerRadius = UDim.new(0, 10)
+
+local TitleLbl = Instance.new("TextLabel", TitleBar)
+TitleLbl.Size = UDim2.new(1, 0, 1, 0)
+TitleLbl.BackgroundTransparency = 1
+TitleLbl.TextColor3 = Color3.new(1,1,1)
+TitleLbl.Text       = "🎃 HalloweenFarm v2 | " .. ENV.name
+TitleLbl.Font       = Enum.Font.GothamBold
+TitleLbl.TextSize   = 13
+
+-- Executor badge
+local Badge = Instance.new("TextLabel", Main)
+Badge.Size = UDim2.new(1, -16, 0, 22)
+Badge.Position = UDim2.new(0, 8, 0, 42)
+Badge.BackgroundColor3 = Color3.fromRGB(30, 15, 50)
+Badge.TextColor3 = Color3.fromRGB(180, 100, 255)
+Badge.Text = "⚙ Executor: " .. ENV.name
+Badge.Font = Enum.Font.Gotham
+Badge.TextSize = 12
+Instance.new("UICorner", Badge).CornerRadius = UDim.new(0, 6)
+
+-- Toggle factory
+local toggleY = 72
+local function MakeToggle(label, setting)
+    local btn = Instance.new("TextButton", Main)
+    btn.Size     = UDim2.new(0, 236, 0, 34)
+    btn.Position = UDim2.new(0, 12, 0, toggleY)
+    toggleY      = toggleY + 42
+
+    local function Refresh()
+        btn.BackgroundColor3 = SETTINGS[setting]
+            and Color3.fromRGB(110, 0, 210)
+            or  Color3.fromRGB(40, 25, 60)
+        btn.Text = label .. "  [" .. (SETTINGS[setting] and "ON" or "OFF") .. "]"
+    end
+
+    btn.TextColor3 = Color3.new(1,1,1)
+    btn.Font       = Enum.Font.Gotham
+    btn.TextSize   = 13
+    btn.BorderSizePixel = 0
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 7)
+    Refresh()
+
+    btn.MouseButton1Click:Connect(function()
+        SETTINGS[setting] = not SETTINGS[setting]
+        Refresh()
+    end)
+end
+
+MakeToggle("🎃 Auto Halloween Farm", "AutoHalloween")
+MakeToggle("📦 Auto Collect Items",  "AutoCollect")
+MakeToggle("🍎 Ghost Fruit Snipe",   "FruitSnipe")
+MakeToggle("💨 Speed Hack (80)",     "SpeedHack")
+MakeToggle("🛡 Safe Mode",           "SafeMode")
+MakeToggle("💤 Anti-AFK",            "AntiAFK")
+
+-- Speed slider label
+local SpeedLbl = Instance.new("TextLabel", Main)
+SpeedLbl.Size = UDim2.new(1, -16, 0, 22)
+SpeedLbl.Position = UDim2.new(0, 8, 0, toggleY + 4)
+SpeedLbl.BackgroundTransparency = 1
+SpeedLbl.TextColor3 = Color3.fromRGB(200, 150, 255)
+SpeedLbl.Text = "Speed: " .. SETTINGS.SpeedValue .. " studs/s"
+SpeedLbl.Font = Enum.Font.Gotham
+SpeedLbl.TextSize = 12
+
+-- ░░ INIT ░░
+StartAntiAFK()
+SpeedLoop()
+task.spawn(HalloweenLoop)
+task.spawn(SnipeLoop)
+
+print("[🎃 HalloweenFarm v2] running on", ENV.name, "— absolute olliE, gng 6767")
